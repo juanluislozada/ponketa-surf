@@ -40,8 +40,9 @@ const T = {
     gust: "Racha",
     water: "Agua",
     clean: "Limpio · offshore",
-    choppy: "Sucio · onshore",
+    crossoff: "Cross-offshore",
     cross: "Cruzado",
+    onshore: "Onshore · sucio",
     nextDays: "Próximos días",
     tapDay: "toca un día para ver las horas",
     loading: "Leyendo el mar…",
@@ -72,8 +73,9 @@ const T = {
     gust: "Gust",
     water: "Water",
     clean: "Clean · offshore",
-    choppy: "Choppy · onshore",
+    crossoff: "Cross-offshore",
     cross: "Cross-shore",
+    onshore: "Onshore · choppy",
     nextDays: "Next days",
     tapDay: "tap a day for the hours",
     loading: "Reading the sea…",
@@ -107,11 +109,12 @@ function angleDiff(a, b) {
 // El viento "viene de" windFrom. Offshore = viene de tierra
 // = del rumbo opuesto al que mira la playa.
 function windQuality(windFrom, coastFacing) {
-  const offshoreSource = (coastFacing + 180) % 360; // norte si mira al sur
-  const d = angleDiff(windFrom, offshoreSource);
-  if (d <= 40) return "clean";
-  if (d >= 130) return "choppy";
-  return "cross";
+  const offshoreSource = (coastFacing + 180) % 360; // de dónde viene el offshore puro
+  const d = angleDiff(windFrom, offshoreSource); // 0 = offshore puro, 180 = onshore puro
+  if (d <= 35) return "clean"; // offshore, limpio
+  if (d <= 70) return "crossoff"; // cross-offshore (de lado, sopla hacia afuera) — favorable
+  if (d <= 130) return "cross"; // cruzado / sideshore (E)
+  return "onshore"; // onshore, sucio (SE/S)
 }
 
 // Veredicto realista: el PERIODO manda. Periodo corto = ola de viento
@@ -136,8 +139,10 @@ function verdict(hFt, periodS, quality) {
   else if (p < 10) qual = 2; // decente
   else if (p < 13) qual = 3; // groundswell
   else qual = 4; // potente
-  if (quality === "clean") qual += 1;
-  else if (quality === "choppy") qual -= 2;
+  if (quality === "clean") qual += 1; // offshore: mejora
+  else if (quality === "crossoff") qual += 0; // cross-offshore: neutral, aceptable
+  else if (quality === "cross") qual -= 1; // cruzado/sideshore: ensucia un poco
+  else if (quality === "onshore") qual -= 2; // onshore: arruina
   if (qual < 0) qual = 0;
 
   const s = size + qual; // 0–9
@@ -150,7 +155,7 @@ function verdict(hFt, periodS, quality) {
   // Topes realistas
   if (p < 6 && (v === "good" || v === "epic")) v = "ride"; // periodo muy corto: máx surfeable
   if (p < 8 && v === "epic") v = "good"; // corto: no épico
-  if (quality === "choppy" && v === "epic") v = "good"; // onshore: no épico
+  if (quality === "onshore" && v === "epic") v = "good"; // onshore: no épico
   if (v === "epic" && size < 4) v = "good"; // épico necesita tamaño real
   return v;
 }
@@ -166,6 +171,7 @@ const PALETTE = {
   sand: "#E9DFC7",
   coral: "#F0653F",
   gold: "#F4B740",
+  green: "#54C98A",
   line: "rgba(234,246,244,0.12)",
 };
 
@@ -186,8 +192,9 @@ function verdictColor(v) {
 
 function qualityColor(q) {
   if (q === "clean") return PALETTE.aqua;
-  if (q === "choppy") return PALETTE.coral;
-  return PALETTE.gold;
+  if (q === "crossoff") return PALETTE.green;
+  if (q === "cross") return PALETTE.gold;
+  return PALETTE.coral; // onshore
 }
 
 export default function App() {
@@ -230,7 +237,7 @@ export default function App() {
           m.hourly.swell_wave_period[i] ??
           m.hourly.wave_period[i];
         const windFrom = w.hourly.wind_direction_10m[i];
-        const q = windFrom == null ? "cross" : windQuality(windFrom, SPOT.coastFacing);
+        const q = windFrom == null ? "crossoff" : windQuality(windFrom, SPOT.coastFacing);
         const hFt = mToFt(waveM);
         return {
           time,
@@ -312,7 +319,12 @@ export default function App() {
     }[v]);
 
   const qualityWord = (q) =>
-    ({ clean: t.clean, choppy: t.choppy, cross: t.cross }[q]);
+    ({
+      clean: t.clean,
+      crossoff: t.crossoff,
+      cross: t.cross,
+      onshore: t.onshore,
+    }[q]);
 
   const css = `
     @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Inter:wght@400;500;600&display=swap');
