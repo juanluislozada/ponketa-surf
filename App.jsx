@@ -54,6 +54,8 @@ const T = {
     feet: "pies",
     today2: "Hoy",
     days: ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"],
+    createdBy: "App creada por",
+    visitSite: "Visitar portal",
   },
   en: {
     now: "Now",
@@ -84,6 +86,8 @@ const T = {
     feet: "ft",
     today2: "Today",
     days: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
+    createdBy: "App created by",
+    visitSite: "Visit site",
   },
 };
 
@@ -105,27 +109,50 @@ function angleDiff(a, b) {
 function windQuality(windFrom, coastFacing) {
   const offshoreSource = (coastFacing + 180) % 360; // norte si mira al sur
   const d = angleDiff(windFrom, offshoreSource);
-  if (d <= 50) return "clean";
+  if (d <= 40) return "clean";
   if (d >= 130) return "choppy";
   return "cross";
 }
 
-// Veredicto sencillo y honesto (altura + periodo + viento)
+// Veredicto realista: el PERIODO manda. Periodo corto = ola de viento
+// (floja y desordenada) y limita el veredicto aunque haya tamaño.
+// El viento limpio/sucio ajusta. Lo épico se reserva para tamaño + groundswell.
 function verdict(hFt, periodS, quality) {
   if (hFt == null || hFt < 1.0) return "flat";
-  let score = 0;
-  if (hFt >= 1.5) score += 1;
-  if (hFt >= 2.5) score += 1;
-  if (hFt >= 4) score += 1;
-  if (periodS >= 8) score += 1;
-  if (periodS >= 11) score += 1;
-  if (quality === "clean") score += 1;
-  if (quality === "choppy") score -= 1;
-  if (score <= 0) return "tiny";
-  if (score === 1) return "tiny";
-  if (score <= 3) return "ride";
-  if (score <= 4) return "good";
-  return "epic";
+  const p = periodS ?? 5;
+
+  // Tamaño (0–4)
+  let size;
+  if (hFt < 1.5) size = 0;
+  else if (hFt < 2.5) size = 1;
+  else if (hFt < 3.5) size = 2;
+  else if (hFt < 5) size = 3;
+  else size = 4;
+
+  // Calidad por periodo (0–4), ajustada por viento
+  let qual;
+  if (p < 6) qual = 0; // ola de viento, floja
+  else if (p < 8) qual = 1; // periodo corto
+  else if (p < 10) qual = 2; // decente
+  else if (p < 13) qual = 3; // groundswell
+  else qual = 4; // potente
+  if (quality === "clean") qual += 1;
+  else if (quality === "choppy") qual -= 2;
+  if (qual < 0) qual = 0;
+
+  const s = size + qual; // 0–9
+  let v;
+  if (s <= 2) v = "tiny";
+  else if (s <= 5) v = "ride";
+  else if (s <= 7) v = "good";
+  else v = "epic";
+
+  // Topes realistas
+  if (p < 6 && (v === "good" || v === "epic")) v = "ride"; // periodo muy corto: máx surfeable
+  if (p < 8 && v === "epic") v = "good"; // corto: no épico
+  if (quality === "choppy" && v === "epic") v = "good"; // onshore: no épico
+  if (v === "epic" && size < 4) v = "good"; // épico necesita tamaño real
+  return v;
 }
 
 const PALETTE = {
@@ -178,7 +205,7 @@ export default function App() {
         `https://marine-api.open-meteo.com/v1/marine?latitude=${SPOT.sampleLat}` +
         `&longitude=${SPOT.sampleLon}` +
         `&hourly=wave_height,wave_direction,wave_period,swell_wave_height,` +
-        `swell_wave_direction,swell_wave_period,sea_surface_temperature` +
+        `swell_wave_direction,swell_wave_period,swell_wave_peak_period,sea_surface_temperature` +
         `&timezone=${encodeURIComponent(tz)}&forecast_days=7`;
       const windUrl =
         `https://api.open-meteo.com/v1/forecast?latitude=${SPOT.sampleLat}` +
@@ -199,7 +226,9 @@ export default function App() {
         const waveM = m.hourly.wave_height[i];
         const swellM = m.hourly.swell_wave_height[i];
         const period =
-          m.hourly.swell_wave_period[i] ?? m.hourly.wave_period[i];
+          m.hourly.swell_wave_peak_period[i] ??
+          m.hourly.swell_wave_period[i] ??
+          m.hourly.wave_period[i];
         const windFrom = w.hourly.wind_direction_10m[i];
         const q = windFrom == null ? "cross" : windQuality(windFrom, SPOT.coastFacing);
         const hFt = mToFt(waveM);
@@ -251,7 +280,7 @@ export default function App() {
             quality: peak.quality,
             period: peak.period,
             swellDir: peak.swellDir,
-            hours: all.filter((r) => r.hour % 3 === 0),
+            hours: all,
           };
         });
 
@@ -387,6 +416,18 @@ export default function App() {
     .ps-hr .qb { width:8px;height:8px;border-radius:50%; display:inline-block; margin-right:5px;}
     .ps-foot { margin-top:26px; font-size:11px; color:${PALETTE.muted}; line-height:1.55; }
     .ps-foot b { color:${PALETTE.sand}; font-weight:600; }
+    .ps-credit {
+      margin-top:22px; padding-top:20px; border-top:1px solid ${PALETTE.line};
+      text-align:center;
+    }
+    .ps-credit-by { font-size:12px; color:${PALETTE.muted}; letter-spacing:0.02em; }
+    .ps-credit-by b { color:${PALETTE.foam}; font-weight:700; }
+    .ps-credit-link {
+      display:inline-flex; align-items:center; gap:6px; margin-top:12px;
+      font-size:12px; font-weight:700; letter-spacing:0.04em;
+      color:${PALETTE.ink}; background:${PALETTE.teal};
+      padding:9px 18px; border-radius:999px; text-decoration:none;
+    }
     .ps-lang {
       position: sticky; top:0; float:right; display:flex; gap:2px;
       background:${PALETTE.ink2}; border:1px solid ${PALETTE.line};
