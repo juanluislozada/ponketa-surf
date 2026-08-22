@@ -1,12 +1,29 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect } from "react";
 
 /*
   ============================================================
   PONKETA SURF — Pronóstico para Don Gregorio / Ponketa, Nizao
   ============================================================
+  v2 — resumen de cambios (detalle en CAMBIOS.md):
+  1. BUG ARREGLADO: `tz` se usaba sin definir en el cliente
+     (ReferenceError silencioso -> la app caía siempre a "error").
+  2. MAREA: se lee `sea_level_height_msl` (Open-Meteo / Copernicus).
+     Se muestra tendencia (subiendo/bajando) + próxima pleamar/bajamar.
+     NO entra en el veredicto: primero valida en el agua qué marea
+     le conviene al banco.
+  3. VIENTO: etiquetas de 16 rumbos (NNE, ENE...) y la calidad se
+     calcula sobre el CENTRO del sector etiquetado -> color y etiqueta
+     nunca se contradicen (problema #4 del README).
+  4. VEREDICTO recalibrado (suave): con viento limpio, el periodo corto
+     penaliza menos. Tu caso real (3.5 ft · 5 s · offshore) ahora sale
+     BUENO, no solo SURFEABLE. Constantes tuneables abajo.
+  5. Cada día muestra su MEJOR VENTANA (mejor hora de luz), no la hora
+     de más ola (que podía ser una tarde onshore).
+  6. Datos marine y wind se alinean POR TIMESTAMP, no por índice.
+  7. Último pronóstico bueno se guarda en localStorage: si no hay señal
+     en la playa, se muestra con aviso de "datos de hace X h".
+
   AJUSTA AQUÍ EL PIN EXACTO DEL SPOT:
-  - Coordenadas estimadas de la desembocadura del río Nizao
-    (Don Gregorio / Ponketa). Cámbialas por el punto real.
   - COAST_FACING: hacia dónde "mira" la playa en grados.
     Costa sur del Caribe => mira al sur (~180°).
     El viento offshore (limpio) viene del lado opuesto (norte, ~0°).
@@ -24,6 +41,10 @@ const SPOT = {
   sampleLon: -70.1977,
 };
 
+const TZ = "America/Santo_Domingo";
+const CACHE_KEY = "ponketa:lastForecast";
+const CACHE_MAX_AGE_H = 24; // más viejo que esto no se muestra ni offline
+
 const T = {
   es: {
     now: "Ahora",
@@ -39,6 +60,17 @@ const T = {
     wind: "Viento",
     gust: "Racha",
     water: "Agua",
+    tide: "Marea",
+    rising: "subiendo",
+    falling: "bajando",
+    energy: "Energía",
+    energyLow: "Baja",
+    energyMed: "Media",
+    energyHigh: "Alta",
+    energyMax: "Muy alta",
+    highTide: "pleamar",
+    lowTide: "bajamar",
+    best: "mejor",
     clean: "Limpio · offshore",
     crossoff: "Cross-offshore",
     cross: "Cruzado",
@@ -49,9 +81,12 @@ const T = {
     errorTitle: "No pude leer el pronóstico",
     errorBody: "Revisa tu conexión y vuelve a intentar.",
     retry: "Reintentar",
+    stale: "Sin conexión · datos de hace {h} h",
     source: "Datos: Open-Meteo Marine · modelo global de oleaje",
     estimate:
       "Estimación del modelo offshore. En un beachbreak de desembocadura la marea y los bancos de arena mandan: confirma en el agua.",
+    tideNote:
+      "Marea: modelo global (~8 km), orientativa en tendencia y horario.",
     feet: "pies",
     today2: "Hoy",
     days: ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"],
@@ -72,6 +107,17 @@ const T = {
     wind: "Wind",
     gust: "Gust",
     water: "Water",
+    tide: "Tide",
+    rising: "rising",
+    falling: "falling",
+    energy: "Energy",
+    energyLow: "Low",
+    energyMed: "Medium",
+    energyHigh: "High",
+    energyMax: "Very high",
+    highTide: "high",
+    lowTide: "low",
+    best: "best",
     clean: "Clean · offshore",
     crossoff: "Cross-offshore",
     cross: "Cross-shore",
@@ -82,9 +128,11 @@ const T = {
     errorTitle: "Couldn't load the forecast",
     errorBody: "Check your connection and try again.",
     retry: "Retry",
+    stale: "Offline · data from {h} h ago",
     source: "Data: Open-Meteo Marine · global wave model",
     estimate:
       "Offshore model estimate. At a river-mouth beachbreak, tide and sandbars rule: confirm in the water.",
+    tideNote: "Tide: global model (~8 km), use for trend and timing only.",
     feet: "ft",
     today2: "Today",
     days: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
@@ -93,9 +141,15 @@ const T = {
   },
 };
 
-const DIRS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
-const dirLabel = (deg) =>
-  deg == null ? "—" : DIRS[Math.round(((deg % 360) / 45)) % 8];
+// 16 rumbos: mejor resolución que 8 y, sobre todo, permite que la
+// CALIDAD del viento se calcule sobre el centro del sector etiquetado.
+// Resultado: la etiqueta y el color siempre cuentan la misma historia.
+const DIRS = [
+  "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+];
+const dirSector = (deg) => Math.round((((deg % 360) + 360) % 360) / 22.5) % 16;
+const dirLabel = (deg) => (deg == null ? "—" : DIRS[dirSector(deg)]);
 
 const mToFt = (m) => (m == null ? null : m * 3.28084);
 
@@ -108,18 +162,35 @@ function angleDiff(a, b) {
 // Calidad del viento relativa a la orientación de la playa.
 // El viento "viene de" windFrom. Offshore = viene de tierra
 // = del rumbo opuesto al que mira la playa.
+// v2: se evalúa el CENTRO del sector de 22.5° (el mismo que la etiqueta),
+// y los umbrales caen en fronteras de sector -> cada rumbo tiene UNA
+// calidad fija. Para Ponketa (offshore = N):
+//   clean:    NNW · N · NNE
+//   crossoff: NW · NE · WNW · ENE
+//   cross:    W · E · WSW · ESE
+//   onshore:  SW · SSW · S · SSE · SE
 function windQuality(windFrom, coastFacing) {
   const offshoreSource = (coastFacing + 180) % 360; // de dónde viene el offshore puro
-  const d = angleDiff(windFrom, offshoreSource); // 0 = offshore puro, 180 = onshore puro
-  if (d <= 35) return "clean"; // offshore, limpio
-  if (d <= 70) return "crossoff"; // cross-offshore (de lado, sopla hacia afuera) — favorable
-  if (d <= 130) return "cross"; // cruzado / sideshore (E)
-  return "onshore"; // onshore, sucio (SE/S)
+  const sectorCenter = dirSector(windFrom) * 22.5;
+  const d = angleDiff(sectorCenter, offshoreSource); // 0 = offshore puro, 180 = onshore puro
+  if (d < 34) return "clean";
+  if (d < 79) return "crossoff";
+  if (d < 124) return "cross";
+  return "onshore";
 }
 
-// Veredicto realista: el PERIODO manda. Periodo corto = ola de viento
-// (floja y desordenada) y limita el veredicto aunque haya tamaño.
-// El viento limpio/sucio ajusta. Lo épico se reserva para tamaño + groundswell.
+/*
+  Veredicto — VERSIÓN FIRME (el periodo manda).
+  Nota: se probó una recalibración que subía "3.5 pies · 5s · limpio" de
+  SURFEABLE a BUENO, pero las sesiones con foto del 19–21 jul lo
+  desmintieron: ese día se confirmó SURFEABLE en el agua ("pequeño pero
+  surfeable"). Así que se mantiene la calibración firme y validada:
+  - Escalones de periodo: <6 / <8 / <10 / <13 s
+  - "ride" (surfeable) hasta score 5; "good" (bueno) desde 6.
+  - Tope duro: periodo <6s => máx surfeable, aunque haya tamaño.
+  - Épico exige tamaño real (5 pies+) + groundswell.
+  Tunea aquí solo con más evidencia del agua, no por teoría.
+*/
 function verdict(hFt, periodS, quality) {
   if (hFt == null || hFt < 1.0) return "flat";
   const p = periodS ?? 5;
@@ -134,7 +205,7 @@ function verdict(hFt, periodS, quality) {
 
   // Calidad por periodo (0–4), ajustada por viento
   let qual;
-  if (p < 6) qual = 0; // ola de viento, floja
+  if (p < 6) qual = 0; // mar de viento, floja
   else if (p < 8) qual = 1; // periodo corto
   else if (p < 10) qual = 2; // decente
   else if (p < 13) qual = 3; // groundswell
@@ -152,13 +223,16 @@ function verdict(hFt, periodS, quality) {
   else if (s <= 7) v = "good";
   else v = "epic";
 
-  // Topes realistas
-  if (p < 6 && (v === "good" || v === "epic")) v = "ride"; // periodo muy corto: máx surfeable
+  // Topes realistas — VERSIÓN FIRME, validada con sesiones reales (19–21 jul):
+  // 3.5 pies · 5s · limpio se confirmó SURFEABLE en el agua, no BUENO.
+  if (p < 6 && (v === "good" || v === "epic")) v = "ride"; // periodo corto: máx surfeable
   if (p < 8 && v === "epic") v = "good"; // corto: no épico
   if (quality === "onshore" && v === "epic") v = "good"; // onshore: no épico
   if (v === "epic" && size < 4) v = "good"; // épico necesita tamaño real
   return v;
 }
+
+const VERDICT_RANK = { flat: 0, tiny: 1, ride: 2, good: 3, epic: 4 };
 
 const PALETTE = {
   ink: "#08222E",
@@ -197,111 +271,222 @@ function qualityColor(q) {
   return PALETTE.coral; // onshore
 }
 
+// ---------- Energía de la ola (pegada) ----------
+// La fuerza real de una ola ~ altura² × periodo (lo que surf-forecast
+// muestra como kJ). Aquí se traduce a lenguaje humano (Baja/Media/Alta),
+// no como número crudo. NO entra al veredicto: el veredicto ya pondera
+// tamaño + periodo; esto es solo lectura rápida de "cuánta fuerza trae".
+// level 0–3 → 4 segmentos de barra. Umbrales calibrados al rango de
+// Ponketa (H ~1–1.8 m, T ~5–8 s).
+function waveEnergy(hM, periodS) {
+  if (hM == null) return null;
+  const p = periodS ?? 5;
+  const e = hM * hM * p; // índice relativo (altura² × periodo)
+  let level, key;
+  if (e < 8) { level = 0; key = "energyLow"; }
+  else if (e < 16) { level = 1; key = "energyMed"; }
+  else if (e < 30) { level = 2; key = "energyHigh"; }
+  else { level = 3; key = "energyMax"; }
+  return { level, key };
+}
+
+function energyColor(level) {
+  if (level >= 3) return PALETTE.gold;
+  if (level === 2) return PALETTE.aqua;
+  if (level === 1) return PALETTE.teal;
+  return PALETTE.muted; // baja
+}
+
+
+// ---------- Marea ----------
+// Extremos (pleamar/bajamar) a partir del nivel del mar horario.
+// El ajuste parabólico con los 3 puntos alrededor del extremo afina
+// la hora a ~minutos (la serie es horaria).
+function tideExtremes(times, levels) {
+  const out = [];
+  if (!levels) return out;
+  for (let i = 1; i < levels.length - 1; i++) {
+    const a = levels[i - 1], b = levels[i], c = levels[i + 1];
+    if (a == null || b == null || c == null) continue;
+    const isHigh = b >= a && b > c;
+    const isLow = b <= a && b < c;
+    if (!isHigh && !isLow) continue;
+    const denom = a - 2 * b + c;
+    const offset = denom !== 0 ? Math.max(-0.5, Math.min(0.5, (0.5 * (a - c)) / denom)) : 0;
+    const hour = parseInt(times[i].slice(11, 13), 10) + offset;
+    const hh = Math.floor(((hour % 24) + 24) % 24);
+    const mm = Math.round((hour - Math.floor(hour)) * 60);
+    out.push({
+      time: times[i],
+      type: isHigh ? "high" : "low",
+      height: b,
+      label: `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`,
+    });
+  }
+  return out;
+}
+
+// Hora local del spot en formato ISO corto ("YYYY-MM-DDTHH")
+function nowIsoLocal() {
+  return new Date()
+    .toLocaleString("sv-SE", { timeZone: TZ })
+    .replace(" ", "T")
+    .slice(0, 13);
+}
+
+// ---------- Construcción del estado a partir del JSON crudo ----------
+// Separado de load() para poder reutilizarlo con la caché offline.
+function buildForecast(m, w) {
+  const times = m.hourly.time;
+  const sea = m.hourly.sea_level_height_msl || null;
+
+  // Alinear viento por TIMESTAMP (no por índice): si alguna API
+  // devuelve series de largo distinto, no se corren los datos.
+  const windIdx = {};
+  (w.hourly.time || []).forEach((tt, i) => (windIdx[tt] = i));
+
+  const rows = times.map((time, i) => {
+    const wi = windIdx[time];
+    const waveM = m.hourly.wave_height[i];
+    const period =
+      m.hourly.swell_wave_peak_period[i] ??
+      m.hourly.swell_wave_period[i] ??
+      m.hourly.wave_period[i];
+    const windFrom = wi != null ? w.hourly.wind_direction_10m[wi] : null;
+    const q = windFrom == null ? "crossoff" : windQuality(windFrom, SPOT.coastFacing);
+    const hFt = mToFt(waveM);
+    // Tendencia de marea: hacia dónde va en la próxima hora
+    let tideTrend = null;
+    if (sea && sea[i] != null) {
+      const next = sea[i + 1] != null ? sea[i + 1] : sea[i];
+      const prev = sea[i - 1] != null ? sea[i - 1] : sea[i];
+      const delta = sea[i + 1] != null ? next - sea[i] : sea[i] - prev;
+      tideTrend = delta >= 0 ? "rising" : "falling";
+    }
+    return {
+      time,
+      date: time.slice(0, 10),
+      hour: parseInt(time.slice(11, 13), 10),
+      waveM,
+      waveFt: hFt,
+      swellM: m.hourly.swell_wave_height[i],
+      period,
+      waveDir: m.hourly.wave_direction[i],
+      swellDir: m.hourly.swell_wave_direction[i],
+      sst: m.hourly.sea_surface_temperature[i],
+      tide: sea ? sea[i] : null,
+      tideTrend,
+      windKn: wi != null ? w.hourly.wind_speed_10m[wi] : null,
+      windFrom,
+      gustKn: wi != null ? w.hourly.wind_gusts_10m[wi] : null,
+      airTemp: wi != null ? w.hourly.temperature_2m[wi] : null,
+      quality: q,
+      verdict: verdict(hFt, period, q),
+    };
+  });
+
+  // Agrupar por día. El resumen del día es su MEJOR VENTANA de luz
+  // (6–18 h): mejor veredicto y, a igual veredicto, más ola. Antes se
+  // usaba la hora de más ola, que podía ser una tarde onshore y hacía
+  // ver el día peor que su mejor momento real.
+  const byDate = {};
+  rows.forEach((r) => {
+    (byDate[r.date] = byDate[r.date] || []).push(r);
+  });
+  const days = Object.keys(byDate)
+    .sort()
+    .slice(0, 7)
+    .map((date) => {
+      const all = byDate[date];
+      const daylight = all.filter((r) => r.hour >= 6 && r.hour <= 18);
+      const pool = daylight.length ? daylight : all;
+      const maxWave = Math.max(...pool.map((r) => r.waveFt ?? 0));
+      const best = pool.reduce((a, b) => {
+        const ra = VERDICT_RANK[a.verdict], rb = VERDICT_RANK[b.verdict];
+        if (rb !== ra) return rb > ra ? b : a;
+        return (b.waveFt ?? 0) > (a.waveFt ?? 0) ? b : a;
+      }, pool[0]);
+      const avgWind =
+        pool.reduce((s, r) => s + (r.windKn ?? 0), 0) / pool.length;
+      return {
+        date,
+        maxWaveFt: maxWave,
+        best,
+        avgWindKn: avgWind,
+        verdict: best.verdict,
+        quality: best.quality,
+        period: best.period,
+        swellDir: best.swellDir,
+        energy: waveEnergy(best.waveM, best.period),
+        hours: all,
+      };
+    });
+
+  const nowIso = nowIsoLocal();
+  const nowRow = rows.find((r) => r.time.slice(0, 13) >= nowIso) || rows[0];
+
+  // Próximo extremo de marea desde "ahora"
+  const extremes = tideExtremes(times, sea);
+  const nextTide =
+    extremes.find((e) => e.time.slice(0, 13) >= nowIso) || null;
+
+  return { now: nowRow, days, nextTide, hasTide: !!sea };
+}
+
 export default function App() {
   const [lang, setLang] = useState("es");
   const [data, setData] = useState(null);
   const [status, setStatus] = useState("loading"); // loading | ok | error
+  const [staleH, setStaleH] = useState(null); // horas de antigüedad si mostramos caché
   const [openDay, setOpenDay] = useState(0);
   const t = T[lang];
 
   async function load() {
     setStatus("loading");
+    setStaleH(null);
+    // Timeout: si en 12s no responde, cortamos y mostramos error (no colgar para siempre)
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
     try {
-      const tz = "America/Santo_Domingo";
-      const marineUrl =
-        `https://marine-api.open-meteo.com/v1/marine?latitude=${SPOT.sampleLat}` +
-        `&longitude=${SPOT.sampleLon}` +
-        `&hourly=wave_height,wave_direction,wave_period,swell_wave_height,` +
-        `swell_wave_direction,swell_wave_period,swell_wave_peak_period,sea_surface_temperature` +
-        `&timezone=${encodeURIComponent(tz)}&forecast_days=7`;
-      const windUrl =
-        `https://api.open-meteo.com/v1/forecast?latitude=${SPOT.sampleLat}` +
-        `&longitude=${SPOT.sampleLon}` +
-        `&hourly=wind_speed_10m,wind_direction_10m,wind_gusts_10m,temperature_2m` +
-        `&wind_speed_unit=kn&timezone=${encodeURIComponent(tz)}&forecast_days=7`;
+      // Los datos se piden a NUESTRO proxy en Vercel (no directo a Open-Meteo),
+      // para esquivar bloqueos de región y aprovechar caché.
+      const res = await fetch(
+        `/api/forecast?lat=${SPOT.sampleLat}&lon=${SPOT.sampleLon}`,
+        { signal: controller.signal }
+      );
+      if (!res.ok) throw new Error("bad response");
+      const { marine: m, wind: w } = await res.json();
+      if (!m || !w || !m.hourly || !w.hourly) throw new Error("bad data");
 
-      const [mRes, wRes] = await Promise.all([
-        fetch(marineUrl),
-        fetch(windUrl),
-      ]);
-      if (!mRes.ok || !wRes.ok) throw new Error("bad response");
-      const m = await mRes.json();
-      const w = await wRes.json();
+      // Guardar el crudo para modo offline (playa sin señal)
+      try {
+        localStorage.setItem(
+          CACHE_KEY,
+          JSON.stringify({ ts: Date.now(), marine: m, wind: w })
+        );
+      } catch (_) {}
 
-      const times = m.hourly.time;
-      const rows = times.map((time, i) => {
-        const waveM = m.hourly.wave_height[i];
-        const swellM = m.hourly.swell_wave_height[i];
-        const period =
-          m.hourly.swell_wave_peak_period[i] ??
-          m.hourly.swell_wave_period[i] ??
-          m.hourly.wave_period[i];
-        const windFrom = w.hourly.wind_direction_10m[i];
-        const q = windFrom == null ? "crossoff" : windQuality(windFrom, SPOT.coastFacing);
-        const hFt = mToFt(waveM);
-        return {
-          time,
-          date: time.slice(0, 10),
-          hour: parseInt(time.slice(11, 13), 10),
-          waveM,
-          waveFt: hFt,
-          swellM,
-          period,
-          waveDir: m.hourly.wave_direction[i],
-          swellDir: m.hourly.swell_wave_direction[i],
-          sst: m.hourly.sea_surface_temperature[i],
-          windKn: w.hourly.wind_speed_10m[i],
-          windFrom,
-          gustKn: w.hourly.wind_gusts_10m[i],
-          airTemp: w.hourly.temperature_2m[i],
-          quality: q,
-          verdict: verdict(hFt, period, q),
-        };
-      });
-
-      // Agrupar por día y resumir horas de luz (6–18)
-      const byDate = {};
-      rows.forEach((r) => {
-        (byDate[r.date] = byDate[r.date] || []).push(r);
-      });
-      const days = Object.keys(byDate)
-        .sort()
-        .slice(0, 7)
-        .map((date) => {
-          const all = byDate[date];
-          const day = all.filter((r) => r.hour >= 6 && r.hour <= 18);
-          const pool = day.length ? day : all;
-          const maxWave = Math.max(...pool.map((r) => r.waveFt ?? 0));
-          const peak = pool.reduce(
-            (a, b) => ((b.waveFt ?? 0) > (a.waveFt ?? 0) ? b : a),
-            pool[0]
-          );
-          const avgWind =
-            pool.reduce((s, r) => s + (r.windKn ?? 0), 0) / pool.length;
-          return {
-            date,
-            maxWaveFt: maxWave,
-            peak,
-            avgWindKn: avgWind,
-            verdict: peak.verdict,
-            quality: peak.quality,
-            period: peak.period,
-            swellDir: peak.swellDir,
-            hours: all,
-          };
-        });
-
-      const nowIso = new Date()
-        .toLocaleString("sv-SE", { timeZone: tz })
-        .replace(" ", "T")
-        .slice(0, 13);
-      let nowRow =
-        rows.find((r) => r.time.slice(0, 13) >= nowIso) || rows[0];
-
-      setData({ now: nowRow, days });
+      setData(buildForecast(m, w));
       setStatus("ok");
     } catch (e) {
+      // Sin red o respuesta mala: intentar el último pronóstico bueno
+      try {
+        const raw = localStorage.getItem(CACHE_KEY);
+        if (raw) {
+          const { ts, marine: m, wind: w } = JSON.parse(raw);
+          const ageH = (Date.now() - ts) / 3600000;
+          if (ageH < CACHE_MAX_AGE_H && m?.hourly && w?.hourly) {
+            setData(buildForecast(m, w));
+            setStaleH(Math.max(1, Math.round(ageH)));
+            setStatus("ok");
+            clearTimeout(timer);
+            return;
+          }
+        }
+      } catch (_) {}
       setStatus("error");
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -362,6 +547,12 @@ export default function App() {
         repeating-linear-gradient(115deg, transparent 0 34px, rgba(54,197,214,0.05) 34px 35px);
       pointer-events:none;
     }
+    .ps-stale {
+      display:inline-block; margin-bottom:10px; font-size:11px; font-weight:600;
+      color:${PALETTE.gold}; background:rgba(244,183,64,0.12);
+      border:1px solid rgba(244,183,64,0.35);
+      padding:5px 10px; border-radius:999px;
+    }
     .ps-nowtag {
       font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
       color: ${PALETTE.muted}; font-weight: 600;
@@ -377,11 +568,14 @@ export default function App() {
       font-size: 30px; letter-spacing:-0.02em;
     }
     .ps-bigwave small { font-size: 14px; color:${PALETTE.muted}; font-weight:500; margin-left:3px;}
+    .ps-chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
     .ps-quality {
-      display:inline-flex; align-items:center; gap:7px; margin-top:14px;
+      display:inline-flex; align-items:center; gap:7px;
       font-size: 13px; font-weight:600; padding: 7px 12px; border-radius: 999px;
       background: rgba(255,255,255,0.05);
     }
+    .ps-ebar { display:inline-flex; gap:3px; margin-left:2px; }
+    .ps-ebar i { width:6px; height:12px; border-radius:2px; display:block; }
     .ps-dot { width:8px; height:8px; border-radius:50%; }
     .ps-stats {
       display:grid; grid-template-columns: repeat(4, 1fr); gap:1px;
@@ -418,11 +612,12 @@ export default function App() {
     .ps-daysub { font-size:11px; color:${PALETTE.muted}; font-weight:500; }
     .ps-hours { border-top:1px solid ${PALETTE.line}; padding: 6px 6px 10px; }
     .ps-hr {
-      display:grid; grid-template-columns: 46px 1fr 56px 60px; gap:8px;
+      display:grid; grid-template-columns: 52px 1fr 56px 66px; gap:8px;
       align-items:center; padding:8px 10px; font-size:12px;
     }
     .ps-hr + .ps-hr { border-top:1px solid rgba(234,246,244,0.05); }
     .ps-hr .hh { color:${PALETTE.muted}; font-weight:600; }
+    .ps-hr .hh .td { color:${PALETTE.aqua}; font-weight:700; }
     .ps-hr .wv { font-family:'Bricolage Grotesque',sans-serif; font-weight:700; }
     .ps-hr .wd { text-align:right; color:${PALETTE.foam}; }
     .ps-hr .qb { width:8px;height:8px;border-radius:50%; display:inline-block; margin-right:5px;}
@@ -528,6 +723,9 @@ export default function App() {
         {status === "ok" && now && (
           <>
             <div className="ps-hero">
+              {staleH != null && (
+                <div className="ps-stale">{t.stale.replace("{h}", staleH)}</div>
+              )}
               <div className="ps-nowtag">{t.now}</div>
               <div className="ps-verdict" style={{ color: verdictColor(now.verdict) }}>
                 {verdictWord(now.verdict)}
@@ -542,9 +740,45 @@ export default function App() {
                 </div>
                 <WindCompass windFrom={now.windFrom} quality={now.quality} />
               </div>
-              <div className="ps-quality" style={{ color: qualityColor(now.quality) }}>
-                <span className="ps-dot" style={{ background: qualityColor(now.quality) }} />
-                {qualityWord(now.quality)} · {now.windKn != null ? Math.round(now.windKn) : "—"} kn {dirLabel(now.windFrom)}
+
+              <div className="ps-chips">
+                <div className="ps-quality" style={{ color: qualityColor(now.quality) }}>
+                  <span className="ps-dot" style={{ background: qualityColor(now.quality) }} />
+                  {qualityWord(now.quality)} · {now.windKn != null ? Math.round(now.windKn) : "—"} kn {dirLabel(now.windFrom)}
+                </div>
+                {data.hasTide && now.tideTrend && (
+                  <div className="ps-quality" style={{ color: PALETTE.foam }}>
+                    <span style={{ color: PALETTE.aqua, fontWeight: 800 }}>
+                      {now.tideTrend === "rising" ? "↑" : "↓"}
+                    </span>
+                    {t.tide} {now.tideTrend === "rising" ? t.rising : t.falling}
+                    {data.nextTide && (
+                      <span style={{ color: PALETTE.muted }}>
+                        · {data.nextTide.type === "high" ? t.highTide : t.lowTide} ~{data.nextTide.label}
+                      </span>
+                    )}
+                  </div>
+                )}
+                {(() => {
+                  const en = waveEnergy(now.waveM, now.period);
+                  if (!en) return null;
+                  return (
+                    <div className="ps-quality" style={{ color: energyColor(en.level) }}>
+                      {t.energy}: {t[en.key]}
+                      <span className="ps-ebar">
+                        {[0, 1, 2, 3].map((i) => (
+                          <i
+                            key={i}
+                            style={{
+                              background:
+                                i <= en.level ? energyColor(en.level) : "rgba(234,246,244,0.15)",
+                            }}
+                          />
+                        ))}
+                      </span>
+                    </div>
+                  );
+                })()}
               </div>
 
               <div className="ps-stats">
@@ -592,8 +826,17 @@ export default function App() {
                           <i style={{ width: `${barW}%`, background: verdictColor(d.verdict) }} />
                         </div>
                         <div className="ps-daysub" style={{ marginTop: 6 }}>
-                          {d.maxWaveFt.toFixed(1)} {t.feet} · {d.period?.toFixed(0)}s · {Math.round(d.avgWindKn)}kn ·{" "}
+                          {d.maxWaveFt.toFixed(1)} {t.feet} · {d.period?.toFixed(0)}s ·{" "}
                           <span style={{ color: qualityColor(d.quality) }}>{qualityWord(d.quality)}</span>
+                          {d.energy && (
+                            <>
+                              {" "}·{" "}
+                              <span style={{ color: energyColor(d.energy.level) }}>
+                                {t.energy.toLowerCase()} {t[d.energy.key].toLowerCase()}
+                              </span>
+                            </>
+                          )}
+                          {" "}· {t.best} ~{String(d.best.hour).padStart(2, "0")}h
                         </div>
                       </div>
                       <div className="ps-dayverdict" style={{ color: verdictColor(d.verdict) }}>
@@ -605,7 +848,12 @@ export default function App() {
                       <div className="ps-hours">
                         {d.hours.map((h) => (
                           <div className="ps-hr" key={h.time}>
-                            <span className="hh">{String(h.hour).padStart(2, "0")}h</span>
+                            <span className="hh">
+                              {String(h.hour).padStart(2, "0")}h
+                              {h.tideTrend && (
+                                <span className="td"> {h.tideTrend === "rising" ? "↑" : "↓"}</span>
+                              )}
+                            </span>
                             <span>
                               <span className="qb" style={{ background: qualityColor(h.quality) }} />
                               <span style={{ color: PALETTE.muted }}>
@@ -628,6 +876,7 @@ export default function App() {
             <div className="ps-foot">
               <b>{SPOT.name}</b> · {SPOT.lat}, {SPOT.lon}<br />
               {t.estimate}<br />
+              {data.hasTide && <>{t.tideNote}<br /></>}
               {t.source}
             </div>
           </>
