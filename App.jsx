@@ -77,6 +77,10 @@ const T = {
     onshore: "Onshore · sucio",
     nextDays: "Próximos días",
     tapDay: "toca un día para ver las horas",
+    backToNow: "Ahora",
+    tapHour: "toca una hora para verla arriba",
+    createdBy: "App creada por",
+    visitSite: "Visitar portal",
     loading: "Leyendo el mar…",
     errorTitle: "No pude leer el pronóstico",
     errorBody: "Revisa tu conexión y vuelve a intentar.",
@@ -124,6 +128,10 @@ const T = {
     onshore: "Onshore · choppy",
     nextDays: "Next days",
     tapDay: "tap a day for the hours",
+    backToNow: "Now",
+    tapHour: "tap an hour to see it above",
+    createdBy: "App created by",
+    visitSite: "Visit site",
     loading: "Reading the sea…",
     errorTitle: "Couldn't load the forecast",
     errorBody: "Check your connection and try again.",
@@ -439,6 +447,8 @@ export default function App() {
   const [status, setStatus] = useState("loading"); // loading | ok | error
   const [staleH, setStaleH] = useState(null); // horas de antigüedad si mostramos caché
   const [openDay, setOpenDay] = useState(0);
+  // Hora seleccionada por el usuario (null = mostrar "AHORA")
+  const [picked, setPicked] = useState(null);
   const t = T[lang];
 
   async function load() {
@@ -616,6 +626,27 @@ export default function App() {
       align-items:center; padding:8px 10px; font-size:12px;
     }
     .ps-hr + .ps-hr { border-top:1px solid rgba(234,246,244,0.05); }
+    .ps-hr { cursor:pointer; border-radius:10px; }
+    .ps-hr.on { background: rgba(54,197,214,0.12); }
+    .ps-nowrow { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .ps-backnow {
+      border:1px solid ${PALETTE.line}; background:rgba(255,255,255,0.06);
+      color:${PALETTE.foam}; font-family:inherit; font-size:11px; font-weight:700;
+      letter-spacing:0.08em; text-transform:uppercase;
+      padding:6px 12px; border-radius:999px; cursor:pointer;
+    }
+    .ps-credit {
+      margin-top:22px; padding-top:20px; border-top:1px solid ${PALETTE.line};
+      text-align:center;
+    }
+    .ps-credit-by { font-size:12px; color:${PALETTE.muted}; letter-spacing:0.02em; }
+    .ps-credit-by b { color:${PALETTE.foam}; font-weight:700; }
+    .ps-credit-link {
+      display:inline-flex; align-items:center; gap:6px; margin-top:12px;
+      font-size:12px; font-weight:700; letter-spacing:0.04em;
+      color:${PALETTE.ink}; background:${PALETTE.teal};
+      padding:9px 18px; border-radius:999px; text-decoration:none;
+    }
     .ps-hr .hh { color:${PALETTE.muted}; font-weight:600; }
     .ps-hr .hh .td { color:${PALETTE.aqua}; font-weight:700; }
     .ps-hr .wv { font-family:'Bricolage Grotesque',sans-serif; font-weight:700; }
@@ -661,7 +692,19 @@ export default function App() {
     @media (prefers-reduced-motion: reduce) { .ps-spin { animation:none; } }
   `;
 
-  const now = data?.now;
+  // El hero muestra la hora seleccionada; si no hay ninguna, muestra "AHORA".
+  const now = picked || data?.now;
+
+  // Etiqueta del hero: "AHORA" o la fecha/hora elegida (ej. "DOM 13/9 · 06h")
+  function heroLabel() {
+    if (!picked) return t.now;
+    const dt = new Date(picked.date + "T12:00:00");
+    const isToday = data?.days?.[0]?.date === picked.date;
+    const dayName = isToday ? t.today2 : t.days[dt.getDay()];
+    return `${dayName} ${dt.getDate()}/${dt.getMonth() + 1} · ${String(
+      picked.hour
+    ).padStart(2, "0")}h`;
+  }
 
   function WindCompass({ windFrom, quality, size = 86 }) {
     const r = size / 2;
@@ -726,7 +769,14 @@ export default function App() {
               {staleH != null && (
                 <div className="ps-stale">{t.stale.replace("{h}", staleH)}</div>
               )}
-              <div className="ps-nowtag">{t.now}</div>
+              <div className="ps-nowrow">
+                <div className="ps-nowtag">{heroLabel()}</div>
+                {picked && (
+                  <button className="ps-backnow" onClick={() => setPicked(null)}>
+                    {t.backToNow}
+                  </button>
+                )}
+              </div>
               <div className="ps-verdict" style={{ color: verdictColor(now.verdict) }}>
                 {verdictWord(now.verdict)}
               </div>
@@ -804,7 +854,7 @@ export default function App() {
             <div className="ps-section">
               <div className="ps-sechead">
                 <h2>{t.nextDays}</h2>
-                <span>{t.tapDay}</span>
+                <span>{openDay >= 0 ? t.tapHour : t.tapDay}</span>
               </div>
 
               {data.days.map((d, idx) => {
@@ -847,7 +897,17 @@ export default function App() {
                     {open && (
                       <div className="ps-hours">
                         {d.hours.map((h) => (
-                          <div className="ps-hr" key={h.time}>
+                          <div
+                            className={
+                              "ps-hr" +
+                              (picked && picked.time === h.time ? " on" : "")
+                            }
+                            key={h.time}
+                            onClick={() => {
+                              setPicked(h);
+                              window.scrollTo({ top: 0, behavior: "smooth" });
+                            }}
+                          >
                             <span className="hh">
                               {String(h.hour).padStart(2, "0")}h
                               {h.tideTrend && (
@@ -878,6 +938,20 @@ export default function App() {
               {t.estimate}<br />
               {data.hasTide && <>{t.tideNote}<br /></>}
               {t.source}
+            </div>
+
+            <div className="ps-credit">
+              <div className="ps-credit-by">
+                {t.createdBy} <b>Ubicua Academy</b>
+              </div>
+              <a
+                className="ps-credit-link"
+                href="https://ubicuaeducacion.com/academy/"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {t.visitSite} ↗
+              </a>
             </div>
           </>
         )}
